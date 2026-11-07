@@ -1,0 +1,115 @@
+name: 同步上游并重建定制 Loon 插件
+
+# 自动同步上游规则，同时保证 custom/ 里的定制插件永不被上游原版覆盖。
+# 全流程只有最后一步会 push；任何一步失败，远程 main 完全不变。
+
+on:
+  schedule:
+    # 每天 UTC 02:17（北京时间约 10:17）。GitHub 定时任务可能延迟，属正常现象。
+    - cron: '17 2 * * *'
+  workflow_dispatch:            # 手动立即执行一次
+  push:                         # 改了裁剪配置时立即重建，无需等定时
+    paths:
+      - 'custom/prune_ads.py'
+      - 'custom/verify_custom.py'
+      - '.github/workflows/sync-upstream.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出仓库（含完整历史）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 若 fork 的 GITHUB_TOKEN 权限受限，可在仓库 Secrets 里配置 SYNC_TOKEN(PAT)
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 配置 git 与 upstream 远程
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/fmz200/wool_scripts.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/fmz200/wool_scripts.git
+          git fetch origin main:refs/remotes/origin/main
+          echo "合并前 HEAD: $(git rev-parse --short HEAD)"
+
+      # ── 防覆盖 ①：合并前完整备份定制资产 ──────────────────────────────
+      - name: 备份 custom/ 定制资产
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/custom-guard
+          mkdir -p /tmp/custom-guard
+          cp -a custom /tmp/custom-guard/custom
+          echo "已备份 $(find custom -type f | wc -l) 个定制文件"
+
+      # ── 合并上游。-X theirs：万一出现冲突，取上游版本（我们对上游自有文件
+      #    不做任何修改），随后由裁剪脚本重新生成定制版，避免流程卡在冲突上。
+      - name: 拉取并合并上游
+        run: |
+          set -euo pipefail
+          git fetch upstream main --no-tags
+          if ! git merge --no-edit -X theirs FETCH_HEAD; then
+            echo "::error::合并上游失败；push 尚未执行，远程 main 保持不变"
+            exit 1
+          fi
+
+      # ── 防覆盖 ②：裁剪逻辑/配置一律以备份为准，不允许上游改写 ─────────
+      - name: 恢复裁剪脚本（上游不得改写）
+        run: |
+          set -euo pipefail
+          mkdir -p custom
+          for f in prune_ads.py verify_custom.py sync-upstream.sh; do
+            if ! cmp -s "/tmp/custom-guard/custom/$f" "custom/$f"; then
+              echo "::warning::上游合并改写了 custom/$f，已从备份恢复"
+              cp -a "/tmp/custom-guard/custom/$f" "custom/$f"
+            fi
+          done
+          echo "裁剪脚本已确认与备份一致"
+
+      # ── 用最新上游规则重新生成定制版（custom/loon/ 为唯一对外订阅路径）──
+      - name: 重新生成定制插件
+        run: python custom/prune_ads.py
+
+      # ── 防覆盖 ③：守卫校验。失败则本 job 立即失败，后续提交/推送全部跳过 ──
+      - name: 守卫校验（失败则不提交、不推送）
+        run: python custom/verify_custom.py --baseline /tmp/custom-guard/custom/loon
+
+      - name: 提交变更
+        run: |
+          set -euo pipefail
+          git add custom/prune_ads.py custom/verify_custom.py custom/sync-upstream.sh \
+                  custom/loon/blockAds.plugin \
+                  custom/loon/blockAdsV2.plugin \
+                  custom/loon/rejectAd.list
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync upstream and rebuild custom Loon plugins [skip ci]"
+          fi
+          AHEAD=$(git rev-list --count origin/main..HEAD)
+          echo "本地领先 origin/main ${AHEAD} 个提交"
+          echo "AHEAD=${AHEAD}" >> "$GITHUB_ENV"
+
+      # ── 全流程唯一的一次 push，只在前述校验全部通过后执行 ───────────────
+      - name: 推送到 main
+        if: env.AHEAD != '0'
+        run: git push origin HEAD:main
+
+      - name: 失败提示
+        if: failure()
+        run: |
+          echo "::error::自动同步失败，远程 main 与 Loon 订阅地址均未发生任何变化。请查看上方日志，或本地执行 python custom/verify_custom.py 排查。"

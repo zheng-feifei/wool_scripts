@@ -8,11 +8,11 @@ Loon 去广告规则裁剪器（幂等，可重复运行，重复运行不会产
   2. 生成 custom/loon/ 下的"稳定订阅版"文件。上游永远不会写这个目录，
      所以订阅 custom/ 路径时，GitHub 网页点 Sync fork 也不会改动你的插件。
 
-推荐工作流（main 分支上 Loon/ 等上游自有文件保持原样，绝不与上游冲突）
-  git fetch upstream main && git merge --no-edit upstream/main   # 或 GitHub 网页点 Sync fork
-  python custom/prune_ads.py                                    # 重新生成 custom/loon/
-  git add custom/loon && git commit && git push
-  也可直接执行：bash custom/sync-upstream.sh
+同步上游由 GitHub Actions 自动完成（.github/workflows/sync-upstream.yml）：
+  每天定时 / 手动触发 / 修改裁剪配置时触发
+  合并上游 -> 备份并恢复 custom/ -> 本脚本重新生成 -> verify_custom.py 守卫校验
+  -> 全部通过才 push。任何一步失败，远程 main 完全不变，订阅地址不会被覆盖。
+本地应急备用：bash custom/sync-upstream.sh
 
 用法（在仓库根目录执行）
   python custom/prune_ads.py                    # 从 Loon/ 读取 -> 生成到 custom/loon/（推荐）
