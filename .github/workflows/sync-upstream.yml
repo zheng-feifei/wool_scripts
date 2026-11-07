@@ -2,17 +2,30 @@ name: 同步上游并重建定制 Loon 插件
 
 # 自动同步上游规则，同时保证 custom/ 里的定制插件永不被上游原版覆盖。
 # 全流程只有最后一步会 push；任何一步失败，远程 main 完全不变。
+#
+# 关于定时（为什么不用「随机」）：
+#   官方原文 —— "High load times include the start of every hour. If the load is
+#   sufficiently high enough, some queued jobs may be dropped. To decrease the chance
+#   of delay, schedule your workflow to run at a different time of the hour."
+#   即：要避开整点，不是要随机。cron 是静态声明，不支持随机表达式；
+#   而在 job 里 sleep 随机数只对「已经启动」的任务生效，救不了调度阶段被丢弃的排队作业，
+#   还会白白消耗 Actions 时长。因此这里用「固定错峰 + 双次冗余」代替随机。
 
 on:
   schedule:
-    # 每天 UTC 02:17（北京时间约 10:17）。GitHub 定时任务可能延迟，属正常现象。
+    # 主触发：每天 UTC 02:17（北京 10:17）。分钟 17 避开 :00 高峰，
+    # 也不是 0/15/30/45 这类扎堆整刻；UTC 02 点同时避开 00:00 的 @daily 拥挤时段。
     - cron: '17 2 * * *'
+    # 冗余触发：每天 UTC 14:43（北京 22:43），与主触发相隔约 12 小时。
+    # 单次任务若在高负载时被丢弃，12 小时后还有一次，当天同步不会落空。
+    - cron: '43 14 * * *'
   workflow_dispatch:            # 手动立即执行一次
   push:                         # 改了裁剪配置时立即重建，无需等定时
     paths:
       - 'custom/prune_ads.py'
       - 'custom/verify_custom.py'
       - '.github/workflows/sync-upstream.yml'
+      # 注意：custom/.last-sync 刻意不在此列表中，避免保活提交自触发循环
 
 permissions:
   contents: write
@@ -56,7 +69,8 @@ jobs:
           rm -rf /tmp/custom-guard
           mkdir -p /tmp/custom-guard
           cp -a custom /tmp/custom-guard/custom
-          echo "已备份 $(find custom -type f | wc -l) 个定制文件"
+          cp -a .github/workflows/sync-upstream.yml /tmp/custom-guard/sync-upstream.yml
+          echo "已备份 $(find custom -type f | wc -l) 个定制文件 + 工作流定义"
 
       # ── 合并上游。-X theirs：万一出现冲突，取上游版本（我们对上游自有文件
       #    不做任何修改），随后由裁剪脚本重新生成定制版，避免流程卡在冲突上。
@@ -81,6 +95,12 @@ jobs:
             fi
           done
           echo "裁剪脚本已确认与备份一致"
+          # 工作流定义同样属于定制资产：上游若新增同名文件，-X theirs 会覆盖它
+          if ! cmp -s /tmp/custom-guard/sync-upstream.yml .github/workflows/sync-upstream.yml; then
+            echo "::warning::上游合并改写了工作流定义，已从备份恢复"
+            mkdir -p .github/workflows
+            cp -a /tmp/custom-guard/sync-upstream.yml .github/workflows/sync-upstream.yml
+          fi
 
       # ── 用最新上游规则重新生成定制版（custom/loon/ 为唯一对外订阅路径）──
       - name: 重新生成定制插件
@@ -90,15 +110,45 @@ jobs:
       - name: 守卫校验（失败则不提交、不推送）
         run: python custom/verify_custom.py --baseline /tmp/custom-guard/custom/loon
 
+      # ── 防止定时任务被 GitHub 自动停用（比「错峰」更容易被忽略的风险）──
+      # 官方：公共仓库 60 天无任何仓库活动，scheduled workflow 会被自动禁用且不会自愈。
+      # 上游长期不更新时，本流程不会产生任何提交 → 没有 push → 60 天后定时直接消失。
+      # 故每 30 天刷新一次状态文件，保证 60 天内必有 push 活动。
+      - name: 仓库保活（每 30 天刷新一次状态）
+        run: |
+          set -euo pipefail
+          STAMP=custom/.last-sync
+          now=$(date -u +%s)
+          last=0
+          if [ -f "$STAMP" ]; then
+            last=$(awk 'NR==1 {print $1}' "$STAMP")
+          fi
+          [[ "$last" =~ ^[0-9]+$ ]] || last=0
+          age=$(( (now - last) / 86400 ))
+          if [ "$age" -ge 30 ]; then
+            trigger="${{ github.event.schedule || github.event_name }}"
+            printf '%s  %s  trigger=%s\n' "$now" "$(date -u +%FT%TZ)" "$trigger" > "$STAMP"
+            echo "距上次刷新 ${age} 天，已更新 $STAMP"
+          else
+            echo "距上次刷新 ${age} 天（<30），本次保持原状"
+          fi
+
       - name: 提交变更
         run: |
           set -euo pipefail
           git add custom/prune_ads.py custom/verify_custom.py custom/sync-upstream.sh \
+                  .github/workflows/sync-upstream.yml \
+                  custom/.last-sync \
                   custom/loon/blockAds.plugin \
                   custom/loon/blockAdsV2.plugin \
                   custom/loon/rejectAd.list
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: sync upstream and rebuild custom Loon plugins [skip ci]"
+          CHANGED=$(git diff --cached --name-only)
+          if [ -n "$CHANGED" ]; then
+            case "$CHANGED" in
+              "custom/.last-sync") MSG="chore: keep scheduled workflow alive [skip ci]" ;;
+              *) MSG="chore: sync upstream and rebuild custom Loon plugins [skip ci]" ;;
+            esac
+            git commit -m "$MSG"
           fi
           AHEAD=$(git rev-list --count origin/main..HEAD)
           echo "本地领先 origin/main ${AHEAD} 个提交"
