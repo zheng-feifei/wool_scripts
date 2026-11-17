@@ -21,7 +21,8 @@ Loon 去广告规则裁剪器（幂等，可重复运行，重复运行不会产
   python custom/prune_ads.py --dry-run         # 只报告会删多少行，不写文件
 
 要增减需要排除的 App，只改下面四个配置项：
-  BLOCK_KEYWORDS / ARG_TAG_KEYWORDS / DROP_HOSTS / DROP_LINE_RE
+  BLOCK_KEYWORDS / ARG_TAG_KEYWORDS / DROP_HOSTS / MITM_DROP_RE /
+  SOURCE_ALIASES / DROP_LINE_RE
 """
 
 from __future__ import annotations
@@ -51,6 +52,8 @@ DROP_HOSTS = {
     "line3-h5-mobile-api.biligame.com",
     "manga.bilibili.com",
     "i*.hdslb.com",
+    # 上游 3.5.1 语法升级后新增的 B站网页版主机名
+    "www.bilibili.com",
     # 掌上英雄联盟
     "mlol.qt.qq.com",
     "ossweb-img.qq.com",
@@ -65,6 +68,24 @@ DROP_LINE_RE = re.compile(
     r"|gab\.122\.gov\.cn|12123",
     re.IGNORECASE,
 )
+
+# [MITM] 主机名兜底：上游每次升级都可能新增被排除 App 的子域名，
+# 光靠 DROP_HOSTS 精确清单会漏（如 3.5.1 新增的 www.bilibili.com）。
+# 这些特征只用于 hostname token，不会误伤 us.l.qq.com 等共用主机。
+MITM_DROP_RE = re.compile(
+    r"bilibili|biliapi|hdslb|biligame"
+    r"|mlol\.qt\.qq\.com|ossweb-img\.qq\.com|gab\.122\.gov\.cn",
+    re.IGNORECASE,
+)
+
+# 上游改名后的源路径别名：左侧路径不存在时按右侧顺序回退。
+# 2026-11-16 上游把 blockAdsV2.plugin 改名为 blockAdsV1.plugin（3.5.1 语法升级），
+# 这里保持输出订阅路径 custom/loon/blockAdsV2.plugin 不变，避免用户改地址。
+SOURCE_ALIASES = {
+    "Loon/plugin/blockAdsV2.plugin": (
+        "Loon/plugin/blockAdsV1.plugin",
+    ),
+}
 
 # 需要裁剪的文件：源文件 -> 稳定订阅版目标文件
 FILE_MAP = {
@@ -166,7 +187,9 @@ def prune(text: str, filename: str, is_plugin: bool):
             head = re.match(r"^(\s*hostname\s*=\s*)(.*)$", line, re.IGNORECASE)
             prefix, body = (head.group(1), head.group(2)) if head else ("", line)
             tokens = [t.strip() for t in body.split(",") if t.strip()]
-            kept_tokens = [t for t in tokens if t not in DROP_HOSTS]
+            kept_tokens = [
+                t for t in tokens if t not in DROP_HOSTS and not MITM_DROP_RE.search(t)
+            ]
             stats["mitm"] += len(tokens) - len(kept_tokens)
             out.append(prefix + ", ".join(kept_tokens))
             i += 1
@@ -202,13 +225,21 @@ def main() -> int:
     total = 0
     for src_rel, dst_rel in FILE_MAP.items():
         src = src_root / src_rel
+        used_rel = src_rel
+        if not src.exists():
+            for alias in SOURCE_ALIASES.get(src_rel, ()):
+                candidate = src_root / alias
+                if candidate.exists():
+                    src, used_rel = candidate, alias
+                    print(f"[别名] {src_rel} -> {alias}（上游改名，订阅路径不变）")
+                    break
         if not src.exists():
             print(f"[跳过] 找不到 {src}")
             continue
         dst = src if args.in_place else dst_root / dst_rel
         with open(src, "r", encoding="utf-8", newline="") as f:
             text = f.read()
-        new_text, st = prune(text, src_rel, is_plugin=src.suffix == ".plugin")
+        new_text, st = prune(text, used_rel, is_plugin=src.suffix == ".plugin")
         removed = len(text.splitlines()) - len(new_text.splitlines())
         total += removed
         action = "跳过(未变化)"

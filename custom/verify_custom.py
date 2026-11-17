@@ -12,7 +12,8 @@ custom/loon 定制插件守卫校验器
   3. 正文中不含 B站 / 掌上英雄联盟 / 12123 的任何特征（#! 头部元数据除外）
   4. 插件 #!desc 带定制标注、#!raw-url 指向本 fork 的 custom/loon/ 路径
   5. [Argument] / [Rule] / [Rewrite] / [Script] / [MITM] 段完整
-  6. [MITM] 不含被排除的 10 个主机名，且 us.l.qq.com 仍在（防止误删其它应用）
+  6. [MITM] 不含被排除的主机名的精确清单/特征正则，且 us.l.qq.com 仍在（防止误删其它应用）
+  7. 上游源路径改名时按 SOURCE_ALIASES 回退，订阅目标文件名始终不变
 
 用法：
   python custom/verify_custom.py
@@ -45,9 +46,22 @@ DROP_HOSTS = {
     "line3-h5-mobile-api.biligame.com",
     "manga.bilibili.com",
     "i*.hdslb.com",
+    "www.bilibili.com",
     "mlol.qt.qq.com",
     "ossweb-img.qq.com",
     "gab.122.gov.cn",
+}
+
+# 与 prune_ads.py 同步的 MITM 主机名兜底特征
+MITM_DROP_RE = re.compile(
+    r"bilibili|biliapi|hdslb|biligame"
+    r"|mlol\.qt\.qq\.com|ossweb-img\.qq\.com|gab\.122\.gov\.cn",
+    re.IGNORECASE,
+)
+
+# 上游改名后的源路径别名（2026-11-16: blockAdsV2 -> blockAdsV1）
+SOURCE_ALIASES = {
+    "Loon/plugin/blockAdsV2.plugin": ("Loon/plugin/blockAdsV1.plugin",),
 }
 
 MUST_KEEP_HOST = "us.l.qq.com"
@@ -103,6 +117,13 @@ def main() -> int:
     for out_name, (src_rel, min_lines) in TARGETS.items():
         out_path = OUT_DIR / out_name
         src_path = ROOT / src_rel
+        if not src_path.is_file():
+            for alias in SOURCE_ALIASES.get(src_rel, ()):
+                candidate = ROOT / alias
+                if candidate.is_file():
+                    src_path = candidate
+                    print(f"  [别名] {src_rel} -> {alias}（上游改名，订阅路径不变）")
+                    break
         if not out_path.is_file():
             fail(f"定制文件缺失：custom/loon/{out_name}")
             continue
@@ -166,7 +187,9 @@ def main() -> int:
             hosts = mitm_hosts(text)
             if len(hosts) < 900:
                 fail(f"{out_name} 的 MITM 只剩 {len(hosts)} 个主机名，疑似被清空")
-            leaked = sorted(DROP_HOSTS & set(hosts))
+            leaked = sorted(
+                h for h in hosts if h in DROP_HOSTS or MITM_DROP_RE.search(h)
+            )
             if leaked:
                 fail(f"{out_name} 的 MITM 仍含被排除主机名：{leaked}")
             if MUST_KEEP_HOST not in hosts:
